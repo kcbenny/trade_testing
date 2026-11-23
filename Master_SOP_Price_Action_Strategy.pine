@@ -1,0 +1,548 @@
+//@version=5
+strategy(
+     title               = "Pure Price Action MTF Intraday Strategy (Master SOP)",
+     shorttitle          = "PA-MTF SOP",
+     overlay             = true,
+     initial_capital     = 10000,
+     pyramiding          = 0,
+     calc_on_every_tick  = false,
+     process_orders_on_close = true,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0.05,
+     max_boxes_count     = 200,
+     max_lines_count     = 200,
+     max_labels_count    = 200
+ )
+
+// ============================================================================
+// 1. INPUTS & CONFIGURATION
+// ============================================================================
+grpCore = "1. 核心系統與時段過濾 (Core & Session)"
+enforce1H         = input.bool(true, "嚴格限制 >= 1H 圖表 (Strict >= 1H Filter)", group=grpCore)
+useSessionFilter  = input.bool(true, "啟用歐美盤時段過濾 (EU-US Session Filter)", group=grpCore)
+sessionWindow     = input.session("0700-2100", "交易時段 (Session Window)", group=grpCore)
+sessionTZ         = input.string("UTC", "時段時區 (Timezone)", options=["UTC", "America/New_York", "Europe/London", "Asia/Hong_Kong", "Exchange"], group=grpCore)
+
+grpMTF = "2. 自上而下 MTF 與空間覆核 (Top-Down & ADR)"
+adrLength         = input.int(14, "日均波幅 ADR 天數 (純K線高低差)", minval=3, maxval=50, group=grpMTF)
+adrSpaceMult      = input.float(1.0, "最小空間要求 (ADR 倍數)", minval=0.2, step=0.1, group=grpMTF)
+htfSwingLen       = input.int(3, "D/4H Swing 左右確認K線數", minval=2, maxval=10, group=grpMTF)
+majorLookback     = input.int(20, "周線/日線大頂底回溯K線數", minval=5, maxval=100, group=grpMTF)
+
+grp1H = "3. 1H 結構、FVG 與倉位配置 (1H Structure & Risk)"
+swingLen1H        = input.int(3, "1H Swing 左右確認K線數", minval=2, maxval=10, group=grp1H)
+eqTolerancePct    = input.float(0.15, "Equal High/Low 容差 (%)", minval=0.01, step=0.05, group=grp1H)
+flipZonePct       = input.float(0.15, "Flip Zone 轉換區寬度 (%)", minval=0.02, step=0.05, group=grp1H)
+fvgMinPct         = input.float(0.05, "FVG 最小缺口比例 (%)", minval=0.0, step=0.01, group=grp1H)
+riskPct           = input.float(1.0, "正手滿倉單筆風險 (% Equity)", minval=0.1, maxval=10.0, step=0.1, group=grp1H)
+allowCounterTrend = input.bool(true, "允許反手方向 (逆勢/區間邊緣小倉位)", group=grp1H)
+counterSizeMult   = input.float(0.5, "反手倉位縮減係數 (如 0.5 = 半倉)", minval=0.1, maxval=0.9, step=0.1, group=grp1H)
+
+grpSetups = "4. 三大進場劇本 (Entry Setups)"
+enableSetupA      = input.bool(true, "劇本 A：深度回調 0.5-0.618 + 重疊區 + 拒絕影線", group=grpSetups)
+wickMinRatio      = input.float(0.45, "劇本 A：拒絕影線佔整根K線最小比例", minval=0.2, maxval=0.8, step=0.05, group=grpSetups)
+enableSetupB      = input.bool(true, "劇本 B：淺回調 / 高位緊湊橫行接貨", group=grpSetups)
+rangeBarsLen      = input.int(6, "劇本 B：橫行區間計算K線數", minval=4, maxval=20, group=grpSetups)
+rangeMaxAdrRatio  = input.float(0.45, "劇本 B：橫行最大波幅 (ADR 比例)", minval=0.15, maxval=1.0, step=0.05, group=grpSetups)
+enableSetupC      = input.bool(true, "劇本 C：強勢實體K線 BOS 突破追擊", group=grpSetups)
+breakoutBodyRatio = input.float(0.60, "劇本 C：突破K線實體佔比要求", minval=0.4, maxval=0.9, step=0.05, group=grpSetups)
+slBufferPct       = input.float(0.05, "止損結構外側緩衝 (%)", minval=0.0, step=0.01, group=grpSetups)
+
+grpTP = "5. 結構化分段止盈與追蹤止損 (TP & Trailing)"
+partialTpPct      = input.int(50, "目標 1 (TP1) 平倉比例 (%)", minval=10, maxval=90, step=5, group=grpTP)
+minTp1RR          = input.float(1.0, "TP1 最小盈虧比保底 (R)", minval=0.5, step=0.1, group=grpTP)
+extendedRR        = input.float(3.0, "目標 2 (TP2) 無遠方Swing時保底盈虧比 (R)", minval=1.5, step=0.5, group=grpTP)
+useTrailingSL     = input.bool(true, "TP1 後啟用 1H 結構追蹤止損", group=grpTP)
+
+grpVis = "6. 圖表視覺化 (Visuals)"
+showFVG           = input.bool(true, "顯示未回補 FVG", group=grpVis)
+showFlipZones     = input.bool(true, "顯示前波段轉換位 (Flip Zones)", group=grpVis)
+showDashboard     = input.bool(true, "顯示 MTF 裁判儀表板", group=grpVis)
+
+// ============================================================================
+// 2. PURE PRICE ACTION HELPER FUNCTIONS (ZERO INDICATORS)
+// ============================================================================
+// Pure price-action swing high / low detector (no indicators)
+f_isSwingHigh(int left, int right) =>
+    bool isHigh = true
+    float pivotPrice = high[right]
+    for i = 0 to left + right
+        if i != right and high[i] >= pivotPrice
+            isHigh := false
+            break
+    isHigh
+
+f_isSwingLow(int left, int right) =>
+    bool isLow = true
+    float pivotPrice = low[right]
+    for i = 0 to left + right
+        if i != right and low[i] <= pivotPrice
+            isLow := false
+            break
+    isLow
+
+// Pure price-action Average Daily Range (average of high - low, no ta.atr/ta.sma)
+f_rawRangeAvg(int len) =>
+    float sumRange = 0.0
+    for i = 0 to len - 1
+        sumRange += (high[i] - low[i])
+    sumRange / len
+
+// Pure price-action highest / lowest over lookback (zero ta.* calls)
+f_highest(float src, int len) =>
+    float res = src
+    for i = 1 to len - 1
+        res := math.max(res, src[i])
+    res
+
+f_lowest(float src, int len) =>
+    float res = src
+    for i = 1 to len - 1
+        res := math.min(res, src[i])
+    res
+
+// Pure price-action HTF structure tracker (runs inside request.security)
+f_htfStructure(int sLen, int mLen) =>
+    var float lastSH = na
+    var float lastSL = na
+    var int bosDir   = 0
+    if f_isSwingHigh(sLen, sLen)
+        lastSH := high[sLen]
+    if f_isSwingLow(sLen, sLen)
+        lastSL := low[sLen]
+    if not na(lastSH) and close > lastSH
+        bosDir := 1
+    else if not na(lastSL) and close < lastSL
+        bosDir := -1
+    float majH = high
+    float majL = low
+    for i = 1 to mLen - 1
+        majH := math.max(majH, high[i])
+        majL := math.min(majL, low[i])
+    [lastSH, lastSL, bosDir, majH, majL]
+
+// ============================================================================
+// 3. CORE FILTERS: TIMEFRAME & SESSION
+// ============================================================================
+bool isValidTF = not enforce1H or timeframe.in_seconds() >= 3600
+
+string tzResolved = sessionTZ == "Exchange" ? syminfo.timezone : sessionTZ
+bool inSession = not useSessionFilter or not na(time(timeframe.period, sessionWindow, tzResolved))
+
+// ============================================================================
+// 4. TOP-DOWN MULTI-TIMEFRAME ANALYSIS & CONFLICT RESOLUTION
+// ============================================================================
+// Weekly: Last closed weekly candle direction
+[wPrevOpen, wPrevClose, wPrevHigh, wPrevLow] = request.security(
+     syminfo.tickerid, "W",
+     [open[1], close[1], high[1], low[1]],
+     lookahead=barmerge.lookahead_on
+ )
+int weeklyBias = wPrevClose > wPrevOpen ? 1 : wPrevClose < wPrevOpen ? -1 : 0
+
+// Daily: ADR, Structure & Major Levels (previous closed Daily bar)
+float dailyADR = request.security(
+     syminfo.tickerid, "D",
+     f_rawRangeAvg(adrLength)[1],
+     lookahead=barmerge.lookahead_on
+ )
+[dSH, dSL, dBos, dMajH, dMajL] = request.security(
+     syminfo.tickerid, "D",
+     f_htfStructure(htfSwingLen, majorLookback)[1],
+     lookahead=barmerge.lookahead_on
+ )
+
+// 4H: Structure (previous closed 4H bar)
+[h4SH, h4SL, h4Bos, h4MajH, h4MajL] = request.security(
+     syminfo.tickerid, "240",
+     f_htfStructure(htfSwingLen, majorLookback)[1],
+     lookahead=barmerge.lookahead_on
+ )
+
+// Conflict Resolution Engine:
+// 1. Recent Structure Priority: If D and 4H agree, they override Weekly candle.
+//    If one of D/4H is neutral, the active recent structure wins.
+// 2. No-Trade Zone: If D and 4H directly oppose each other, or no clear bias exists.
+bool dAnd4HConflict = (dBos != 0 and h4Bos != 0 and dBos != h4Bos)
+int recentStructureBias = dAnd4HConflict ? 0 : (h4Bos != 0 ? h4Bos : dBos)
+int macroBias = dAnd4HConflict ? 0 : (recentStructureBias != 0 ? recentStructureBias : weeklyBias)
+bool isNoTradeZone = dAnd4HConflict or macroBias == 0
+
+// Space Check against Weekly/Daily Major S/R using ADR
+float majorResistance = not na(dMajH) and not na(wPrevHigh) ? math.max(dMajH, wPrevHigh) : nz(dMajH, wPrevHigh)
+float majorSupport    = not na(dMajL) and not na(wPrevLow)  ? math.min(dMajL, wPrevLow)  : nz(dMajL, wPrevLow)
+
+float spaceUp   = not na(majorResistance) ? (majorResistance - close) : 9e9
+float spaceDown = not na(majorSupport)    ? (close - majorSupport)    : 9e9
+bool hasLongSpace  = not na(dailyADR) and dailyADR > 0 ? spaceUp   >= dailyADR * adrSpaceMult : true
+bool hasShortSpace = not na(dailyADR) and dailyADR > 0 ? spaceDown >= dailyADR * adrSpaceMult : true
+
+// ============================================================================
+// 5. 1H STRUCTURE, BOS, LIQUIDITY (EQH/EQL), FLIP ZONES & FVG
+// ============================================================================
+type FVG
+    float top
+    float bottom
+    int   dir       // 1 = bullish, -1 = bearish
+    int   barIdx
+    bool  mitigated
+    box   bx
+
+type FlipZone
+    float top
+    float bottom
+    int   dir       // 1 = support flip, -1 = resistance flip
+    int   barIdx
+    box   bx
+
+var array<float> shPrices = array.new_float()
+var array<int>   shBars   = array.new_int()
+var array<float> slPrices = array.new_float()
+var array<int>   slBars   = array.new_int()
+
+var array<FVG>      fvgList  = array.new<FVG>()
+var array<FlipZone> flipList = array.new<FlipZone>()
+
+var float activeSH       = na
+var float activeSL       = na
+var float prevSH         = na
+var float prevSL         = na
+var int   bos1H          = 0
+var float impulseStart   = na
+var float impulseEnd     = na
+var int   impulseDir     = 0
+var bool  eqHighDetected = false
+var bool  eqLowDetected  = false
+
+// Detect 1H Swing Highs & Equal Highs
+if f_isSwingHigh(swingLen1H, swingLen1H)
+    float newSH = high[swingLen1H]
+    int   newSHBar = bar_index - swingLen1H
+    eqHighDetected := not na(activeSH) and math.abs(newSH - activeSH) / activeSH * 100.0 <= eqTolerancePct
+    prevSH   := activeSH
+    activeSH := newSH
+    array.unshift(shPrices, newSH)
+    array.unshift(shBars, newSHBar)
+    if array.size(shPrices) > 30
+        array.pop(shPrices)
+        array.pop(shBars)
+
+// Detect 1H Swing Lows & Equal Lows
+if f_isSwingLow(swingLen1H, swingLen1H)
+    float newSL = low[swingLen1H]
+    int   newSLBar = bar_index - swingLen1H
+    eqLowDetected := not na(activeSL) and math.abs(newSL - activeSL) / activeSL * 100.0 <= eqTolerancePct
+    prevSL   := activeSL
+    activeSL := newSL
+    array.unshift(slPrices, newSL)
+    array.unshift(slBars, newSLBar)
+    if array.size(slPrices) > 30
+        array.pop(slPrices)
+        array.pop(slBars)
+
+// Detect 1H BOS & Create Flip Zones
+bool freshBullBOS = false
+bool freshBearBOS = false
+
+if not na(activeSH) and close > activeSH and close[1] <= activeSH
+    freshBullBOS := true
+    bos1H        := 1
+    impulseDir   := 1
+    impulseStart := nz(activeSL, low[1])
+    impulseEnd   := high
+    float halfBuf = activeSH * (flipZonePct / 100.0) * 0.5
+    box b = showFlipZones ? box.new(bar_index, activeSH + halfBuf, bar_index + 15, activeSH - halfBuf,
+         border_color=color.new(color.teal, 50), bgcolor=color.new(color.teal, 85)) : na
+    array.unshift(flipList, FlipZone.new(activeSH + halfBuf, activeSH - halfBuf, 1, bar_index, b))
+    if array.size(flipList) > 20
+        FlipZone oldFZ = array.pop(flipList)
+        if not na(oldFZ.bx)
+            box.delete(oldFZ.bx)
+
+if not na(activeSL) and close < activeSL and close[1] >= activeSL
+    freshBearBOS := true
+    bos1H        := -1
+    impulseDir   := -1
+    impulseStart := nz(activeSH, high[1])
+    impulseEnd   := low
+    float halfBuf = activeSL * (flipZonePct / 100.0) * 0.5
+    box b = showFlipZones ? box.new(bar_index, activeSL + halfBuf, bar_index + 15, activeSL - halfBuf,
+         border_color=color.new(color.maroon, 50), bgcolor=color.new(color.maroon, 85)) : na
+    array.unshift(flipList, FlipZone.new(activeSL + halfBuf, activeSL - halfBuf, -1, bar_index, b))
+    if array.size(flipList) > 20
+        FlipZone oldFZ = array.pop(flipList)
+        if not na(oldFZ.bx)
+            box.delete(oldFZ.bx)
+
+// Update active impulse extreme while trend continues
+if impulseDir == 1
+    impulseEnd := math.max(nz(impulseEnd, high), high)
+else if impulseDir == -1
+    impulseEnd := math.min(nz(impulseEnd, low), low)
+
+// Detect Unmitigated FVGs (3-candle imbalance)
+float bullGapPct = low > high[2] ? (low - high[2]) / close * 100.0 : 0.0
+if bullGapPct > fvgMinPct
+    box b = showFVG ? box.new(bar_index - 2, low, bar_index + 10, high[2],
+         border_color=color.new(color.green, 60), bgcolor=color.new(color.green, 85)) : na
+    array.unshift(fvgList, FVG.new(low, high[2], 1, bar_index, false, b))
+
+float bearGapPct = high < low[2] ? (low[2] - high) / close * 100.0 : 0.0
+if bearGapPct > fvgMinPct
+    box b = showFVG ? box.new(bar_index - 2, low[2], bar_index + 10, high,
+         border_color=color.new(color.red, 60), bgcolor=color.new(color.red, 85)) : na
+    array.unshift(fvgList, FVG.new(low[2], high, -1, bar_index, false, b))
+
+while array.size(fvgList) > 30
+    FVG oldFvg = array.pop(fvgList)
+    if not na(oldFvg.bx)
+        box.delete(oldFvg.bx)
+
+// Check FVG Mitigation & Confluence Helpers
+bool inBullFVG = false
+bool inBearFVG = false
+if array.size(fvgList) > 0
+    for i = 0 to array.size(fvgList) - 1
+        FVG f = array.get(fvgList, i)
+        if not f.mitigated and bar_index > f.barIdx
+            if f.dir == 1
+                if low <= f.top and high >= f.bottom
+                    inBullFVG := true
+                if close < f.bottom
+                    f.mitigated := true
+            else
+                if high >= f.bottom and low <= f.top
+                    inBearFVG := true
+                if close > f.top
+                    f.mitigated := true
+            if showFVG and not na(f.bx)
+                if f.mitigated
+                    box.set_bgcolor(f.bx, color.new(color.gray, 95))
+                    box.set_border_color(f.bx, color.new(color.gray, 85))
+                else
+                    box.set_right(f.bx, bar_index + 5)
+
+bool inBullFlip = false
+bool inBearFlip = false
+if array.size(flipList) > 0
+    for i = 0 to array.size(flipList) - 1
+        FlipZone fz = array.get(flipList, i)
+        if bar_index > fz.barIdx
+            if fz.dir == 1 and low <= fz.top and high >= fz.bottom
+                inBullFlip := true
+            if fz.dir == -1 and high >= fz.bottom and low <= fz.top
+                inBearFlip := true
+            if showFlipZones and not na(fz.bx)
+                box.set_right(fz.bx, bar_index + 5)
+
+bool bullConfluence = inBullFVG or inBullFlip
+bool bearConfluence = inBearFVG or inBearFlip
+
+// ============================================================================
+// 6. THREE ENTRY SETUPS (A, B, C) & DIRECTIONAL LOGIC
+// ============================================================================
+float candleRange = high - low
+float bodySize    = math.abs(close - open)
+float upperWick   = high - math.max(open, close)
+float lowerWick   = math.min(open, close) - low
+
+bool bullRejectionWick = candleRange > 0 and (lowerWick / candleRange) >= wickMinRatio and close >= open
+bool bearRejectionWick = candleRange > 0 and (upperWick / candleRange) >= wickMinRatio and close <= open
+bool strongBullBody    = candleRange > 0 and (bodySize / candleRange) >= breakoutBodyRatio and close > open
+bool strongBearBody    = candleRange > 0 and (bodySize / candleRange) >= breakoutBodyRatio and close < open
+
+// Fibonacci 0.5 - 0.618 Pullback Zone
+float impRange   = not na(impulseEnd) and not na(impulseStart) ? math.abs(impulseEnd - impulseStart) : 0.0
+float fib50Long  = impulseDir == 1  and impRange > 0 ? impulseEnd - impRange * 0.500 : na
+float fib618Long = impulseDir == 1  and impRange > 0 ? impulseEnd - impRange * 0.618 : na
+float fib50Short = impulseDir == -1 and impRange > 0 ? impulseEnd + impRange * 0.500 : na
+float fib618Short= impulseDir == -1 and impRange > 0 ? impulseEnd + impRange * 0.618 : na
+
+bool inLongFibZone  = not na(fib50Long)  and low  <= fib50Long  and high >= fib618Long
+bool inShortFibZone = not na(fib50Short) and high >= fib50Short and low  <= fib618Short
+
+// Setup A: Deep Pullback (0.5 - 0.618) + Confluence (FVG/Flip) + Rejection Wick
+bool setupA_Long  = enableSetupA and impulseDir == 1  and inLongFibZone  and bullConfluence and bullRejectionWick
+bool setupA_Short = enableSetupA and impulseDir == -1 and inShortFibZone and bearConfluence and bearRejectionWick
+
+// Setup B: Shallow Pullback / Tight Consolidation Range
+float consHigh = f_highest(high[1], rangeBarsLen)
+float consLow  = f_lowest(low[1], rangeBarsLen)
+float consWidth = consHigh - consLow
+bool  isTightRange = not na(dailyADR) and dailyADR > 0 and consWidth <= dailyADR * rangeMaxAdrRatio
+
+bool setupB_Long  = enableSetupB and isTightRange and (na(fib50Long) or consLow > fib50Long) and low <= consLow * (1 + slBufferPct / 100.0) and close > consLow and close > open
+bool setupB_Short = enableSetupB and isTightRange and (na(fib50Short) or consHigh < fib50Short) and high >= consHigh * (1 - slBufferPct / 100.0) and close < consHigh and close < open
+
+// Setup C: Strong Momentum BOS Breakout
+bool setupC_Long  = enableSetupC and freshBullBOS and strongBullBody
+bool setupC_Short = enableSetupC and freshBearBOS and strongBearBody
+
+// Determine With-Trend vs Counter-Trend Eligibility
+bool canLongWithTrend     = not isNoTradeZone and macroBias == 1  and hasLongSpace
+bool canShortWithTrend    = not isNoTradeZone and macroBias == -1 and hasShortSpace
+
+// Counter-trend only allowed at HTF/1H extreme rejection (Setup A or Range Edge) when enabled
+bool canLongCounterTrend  = allowCounterTrend and not isNoTradeZone and macroBias == -1 and hasLongSpace  and (inBullFlip or eqLowDetected)
+bool canShortCounterTrend = allowCounterTrend and not isNoTradeZone and macroBias == 1  and hasShortSpace and (inBearFlip or eqHighDetected)
+
+bool triggerLong  = isValidTF and inSession and strategy.position_size == 0 and (
+     (canLongWithTrend  and (setupA_Long  or setupB_Long  or setupC_Long)) or
+     (canLongCounterTrend and (setupA_Long or setupB_Long))
+ )
+
+bool triggerShort = isValidTF and inSession and strategy.position_size == 0 and (
+     (canShortWithTrend  and (setupA_Short or setupB_Short or setupC_Short)) or
+     (canShortCounterTrend and (setupA_Short or setupB_Short))
+ )
+
+// ============================================================================
+// 7. SL, STRUCTURAL TP1 / TP2, BREAKEVEN & TRAILING STOP MANAGEMENT
+// ============================================================================
+f_nextSwingTarget(int dir, float refPrice, float minDist) =>
+    float best = na
+    if dir == 1 and array.size(shPrices) > 0
+        for i = 0 to array.size(shPrices) - 1
+            float p = array.get(shPrices, i)
+            if p >= refPrice + minDist
+                best := na(best) ? p : math.min(best, p)
+    else if dir == -1 and array.size(slPrices) > 0
+        for i = 0 to array.size(slPrices) - 1
+            float p = array.get(slPrices, i)
+            if p <= refPrice - minDist
+                best := na(best) ? p : math.max(best, p)
+    best
+
+var float entryPx    = na
+var float currentSL  = na
+var float tp1Px      = na
+var float tp2Px      = na
+var bool  tp1Reached = false
+var string activeSetupLabel = ""
+
+// Reset state when flat
+if strategy.position_size == 0
+    entryPx    := na
+    currentSL  := na
+    tp1Px      := na
+    tp2Px      := na
+    tp1Reached := false
+
+// Execute Long Entry
+if triggerLong and not triggerShort
+    float rawSL = setupA_Long ? nz(impulseStart, nz(activeSL, low)) :
+                  setupB_Long ? consLow :
+                  math.min(low, nz(activeSL, low))
+    float sl = rawSL * (1.0 - slBufferPct / 100.0)
+    float riskDist = close - sl
+    if riskDist > 0
+        float sizeMult = canLongWithTrend ? 1.0 : counterSizeMult
+        float riskAmt  = strategy.equity * (riskPct / 100.0) * sizeMult
+        float qty      = riskAmt / (riskDist * syminfo.pointvalue)
+        float structTP1 = f_nextSwingTarget(1, close, riskDist * minTp1RR)
+        float t1        = na(structTP1) ? close + riskDist * minTp1RR : structTP1
+        float structTP2 = f_nextSwingTarget(1, t1, riskDist * 0.5)
+        float t2        = na(structTP2) ? close + riskDist * extendedRR : math.max(structTP2, t1 + riskDist)
+        string tag      = setupC_Long ? "C-BOS" : setupB_Long ? "B-Range" : "A-Fib"
+        string modeTag  = canLongWithTrend ? "順勢" : "反手小倉"
+        activeSetupLabel := tag + "(" + modeTag + ")"
+        entryPx    := close
+        currentSL  := sl
+        tp1Px      := t1
+        tp2Px      := t2
+        tp1Reached := false
+        strategy.entry("Long", strategy.long, qty=qty, comment=activeSetupLabel)
+
+// Execute Short Entry
+if triggerShort and not triggerLong
+    float rawSL = setupA_Short ? nz(impulseStart, nz(activeSH, high)) :
+                  setupB_Short ? consHigh :
+                  math.max(high, nz(activeSH, high))
+    float sl = rawSL * (1.0 + slBufferPct / 100.0)
+    float riskDist = sl - close
+    if riskDist > 0
+        float sizeMult = canShortWithTrend ? 1.0 : counterSizeMult
+        float riskAmt  = strategy.equity * (riskPct / 100.0) * sizeMult
+        float qty      = riskAmt / (riskDist * syminfo.pointvalue)
+        float structTP1 = f_nextSwingTarget(-1, close, riskDist * minTp1RR)
+        float t1        = na(structTP1) ? close - riskDist * minTp1RR : structTP1
+        float structTP2 = f_nextSwingTarget(-1, t1, riskDist * 0.5)
+        float t2        = na(structTP2) ? close - riskDist * extendedRR : math.min(structTP2, t1 - riskDist)
+        string tag      = setupC_Short ? "C-BOS" : setupB_Short ? "B-Range" : "A-Fib"
+        string modeTag  = canShortWithTrend ? "順勢" : "反手小倉"
+        activeSetupLabel := tag + "(" + modeTag + ")"
+        entryPx    := close
+        currentSL  := sl
+        tp1Px      := t1
+        tp2Px      := t2
+        tp1Reached := false
+        strategy.entry("Short", strategy.short, qty=qty, comment=activeSetupLabel)
+
+// Manage Active Long: TP1 -> Breakeven -> Structural Trailing SL
+if strategy.position_size > 0
+    if not tp1Reached and (high >= tp1Px or math.abs(strategy.position_size) < math.abs(strategy.position_size[1]))
+        tp1Reached := true
+        currentSL  := math.max(currentSL, entryPx)
+    if tp1Reached and useTrailingSL and freshBullBOS and not na(activeSL)
+        float trailSL = activeSL * (1.0 - slBufferPct / 100.0)
+        if trailSL < close
+            currentSL := math.max(currentSL, trailSL)
+    if not tp1Reached
+        strategy.exit("Long TP1", from_entry="Long", qty_percent=partialTpPct, limit=tp1Px, stop=currentSL)
+    strategy.exit("Long TP2", from_entry="Long", limit=tp2Px, stop=currentSL)
+
+// Manage Active Short: TP1 -> Breakeven -> Structural Trailing SL
+if strategy.position_size < 0
+    if not tp1Reached and (low <= tp1Px or math.abs(strategy.position_size) < math.abs(strategy.position_size[1]))
+        tp1Reached := true
+        currentSL  := math.min(currentSL, entryPx)
+    if tp1Reached and useTrailingSL and freshBearBOS and not na(activeSH)
+        float trailSL = activeSH * (1.0 + slBufferPct / 100.0)
+        if trailSL > close
+            currentSL := math.min(currentSL, trailSL)
+    if not tp1Reached
+        strategy.exit("Short TP1", from_entry="Short", qty_percent=partialTpPct, limit=tp1Px, stop=currentSL)
+    strategy.exit("Short TP2", from_entry="Short", limit=tp2Px, stop=currentSL)
+
+// Plot Active SL / TP1 / TP2 Lines
+plot(strategy.position_size != 0 ? currentSL : na, "Active SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 and not tp1Reached ? tp1Px : na, "TP1 (Scale-Out)", color=color.teal, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? tp2Px : na, "TP2 (Extended)", color=color.green, style=plot.style_linebr, linewidth=2)
+
+// ============================================================================
+// 8. MTF CONFLICT RESOLUTION & STATUS DASHBOARD
+// ============================================================================
+f_dirText(int d) =>
+    d == 1 ? "看多 (Bull)" : d == -1 ? "看空 (Bear)" : "中性 (Neutral)"
+
+f_dirColor(int d) =>
+    d == 1 ? color.teal : d == -1 ? color.maroon : color.gray
+
+var table dash = table.new(position.top_right, 2, 7, border_width=1, border_color=color.new(color.gray, 60))
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "Master SOP 儀表板", text_color=color.white, bgcolor=color.new(color.navy, 20), text_size=size.small)
+    table.cell(dash, 1, 0, isValidTF ? "1H+ 有效" : "請切換至 >=1H", text_color=color.white, bgcolor=isValidTF ? color.teal : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 1, "交易時段 (EU-US)", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    table.cell(dash, 1, 1, inSession ? "活躍時段" : "亞洲盤/休市", text_color=color.white, bgcolor=inSession ? color.teal : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 2, "周線單支方向", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    table.cell(dash, 1, 2, f_dirText(weeklyBias), text_color=color.white, bgcolor=f_dirColor(weeklyBias), text_size=size.small)
+
+    table.cell(dash, 0, 3, "日線 / 4H BOS", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    table.cell(dash, 1, 3, (dBos == 1 ? "D+" : dBos == -1 ? "D-" : "D0") + " / " + (h4Bos == 1 ? "4H+" : h4Bos == -1 ? "4H-" : "4H0"),
+         text_color=color.white, bgcolor=dAnd4HConflict ? color.orange : f_dirColor(recentStructureBias), text_size=size.small)
+
+    table.cell(dash, 0, 4, "MTF 裁判結果", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    table.cell(dash, 1, 4, isNoTradeZone ? "無效混戰區 (空倉)" : f_dirText(macroBias),
+         text_color=color.white, bgcolor=isNoTradeZone ? color.orange : f_dirColor(macroBias), text_size=size.small)
+
+    table.cell(dash, 0, 5, "空間覆核 (ADR)", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    bool spaceOK = macroBias == 1 ? hasLongSpace : macroBias == -1 ? hasShortSpace : false
+    table.cell(dash, 1, 5, spaceOK ? "空間充足 (>=1 ADR)" : "空間不足 (放棄順勢)",
+         text_color=color.white, bgcolor=spaceOK ? color.teal : color.maroon, text_size=size.small)
+
+    table.cell(dash, 0, 6, "當前倉位狀態", text_color=color.white, bgcolor=color.new(color.black, 30), text_size=size.small)
+    string posTxt = strategy.position_size > 0 ? "多單 " + (tp1Reached ? "(已保本追蹤)" : "(待TP1)") :
+                    strategy.position_size < 0 ? "空單 " + (tp1Reached ? "(已保本追蹤)" : "(待TP1)") : "空倉觀望"
+    table.cell(dash, 1, 6, posTxt, text_color=color.white, bgcolor=strategy.position_size != 0 ? color.blue : color.gray, text_size=size.small)
